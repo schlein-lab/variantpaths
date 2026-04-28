@@ -6,7 +6,10 @@ genome-wide structural variants as graph paths — stacked like reads in IGV,
 with optional alt-sequences, multiple-sequence alignment, and reference
 overlay. No installer. No server. No browser plugin.
 
-🌐 [variantpaths.com](https://variantpaths.com)
+🌐 [variantpaths.com](https://variantpaths.com) ·
+🧬 Built to consume output from [BRANCH](https://github.com/schlein-lab/branch)
+([branch-assembler.com](https://branch-assembler.com)) — the upstream
+mosaic-aware HiFi assembler from the same lab.
 
 ---
 
