@@ -1,0 +1,28 @@
+[package]
+name = "variantpaths"
+version = "0.1.0"
+edition = "2021"
+authors = ["Schlein Lab"]
+description = "Standalone genome-graph viewer for structural variant paths"
+license = "MIT"
+repository = "https://github.com/schlein-lab/variantpaths"
+homepage = "https://variantpaths.com"
+
+[[bin]]
+name = "variantpaths"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.27"
+zstd = { version = "0.13", default-features = false }
+byteorder = "1.5"
+anyhow = "1"
+rfd = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

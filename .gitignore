@@ -1,0 +1,22 @@
+/target
+/target-cross
+/dist
+Cargo.lock
+*.swp
+*.bak
+.DS_Store
+
+# build artifacts
+*.exe
+*.so
+*.dll
+*.dylib
+
+# python build helpers may produce these
+*.pyc
+__pycache__/
+.venv/
+
+# editor / IDE
+.idea/
+.vscode/
