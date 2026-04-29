@@ -1,38 +1,42 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod format;
+mod heatmap;
 mod model;
 mod view;
 mod render;
 mod msa;
+mod ui_topbar;
 
 use eframe::egui;
 use std::path::PathBuf;
 
-use crate::format::{annot::AnnotTrack, bbf::Bbf, bbz::Bbz, fasta::FastaReader};
+use crate::format::{annot::{AnnotFeature, AnnotTrack, igh_default_track}, bbf::Bbf, bbz::Bbz, fasta::FastaReader};
 use crate::model::Atlas;
-use crate::view::{SharedFilter, ViewState};
+use crate::view::ViewState;
 use crate::render::{
     bp_to_x, x_to_bp, draw_ruler, draw_sequence, draw_annotation,
     draw_bubble_track, draw_unmapped_overlay, pick_mode, format_bp,
     RULER_H, SEQ_H, ANNOT_H, SAMPLE_LABEL_W, LANE_H, LANE_GAP,
 };
 
-struct App {
-    atlas: Atlas,
-    view: ViewState,
-    error_msg: Option<String>,
-    info_msg: Option<String>,
-    drag_active: bool,
+pub(crate) struct App {
+    pub(crate) atlas: Atlas,
+    pub(crate) view: ViewState,
+    pub(crate) error_msg: Option<String>,
+    pub(crate) info_msg: Option<String>,
+    pub(crate) drag_active: bool,
     /// Rolling timing buffers for the on-screen perf overlay (visible
     /// when --perf or F11).
-    perf_visible: bool,
-    last_frame_ms: f32,
-    last_query_ms: f32,
-    last_render_ms: f32,
-    last_visible_n: u32,
-    msa_state: Option<msa::MsaState>,
-    msa_open: bool,
+    pub(crate) perf_visible: bool,
+    pub(crate) last_frame_ms: f32,
+    pub(crate) last_query_ms: f32,
+    pub(crate) last_render_ms: f32,
+    pub(crate) last_visible_n: u32,
+    pub(crate) msa_state: Option<msa::MsaState>,
+    pub(crate) msa_open: bool,
+    /// Show the cross-sample density heatmap above the per-sample tracks.
+    pub(crate) heatmap_visible: bool,
 }
 
 impl App {
@@ -51,6 +55,7 @@ impl App {
             last_visible_n: 0,
             msa_state: None,
             msa_open: false,
+            heatmap_visible: true,
         };
         // Process CLI args by extension
         for arg in args.iter().skip(1) {
@@ -88,7 +93,7 @@ impl App {
         }
     }
 
-    fn load_bbf(&mut self, path: &PathBuf) {
+    pub(crate) fn load_bbf(&mut self, path: &PathBuf) {
         match Bbf::open(path) {
             Ok(b) => {
                 self.info_msg = Some(format!(
@@ -119,7 +124,7 @@ impl App {
         }
     }
 
-    fn load_fasta(&mut self, path: &PathBuf) {
+    pub(crate) fn load_fasta(&mut self, path: &PathBuf) {
         match FastaReader::open(path) {
             Ok(fa) => {
                 self.info_msg = Some(format!(
@@ -133,7 +138,7 @@ impl App {
         }
     }
 
-    fn load_bed(&mut self, path: &PathBuf) {
+    pub(crate) fn load_bed(&mut self, path: &PathBuf) {
         match AnnotTrack::open_bed(path) {
             Ok(t) => {
                 self.info_msg = Some(format!("loaded annot {} ({} features)",
@@ -156,19 +161,62 @@ impl App {
             .map(|c| c.length_bp)
     }
 
-    fn jump_to(&mut self, q: &str) {
-        // accepts:  "chr14:105_678_492"  "chr14"  "105678492"
+    pub(crate) fn jump_to(&mut self, q: &str) {
+        // accepts:
+        //   "chr14:105_678_492" or "chr14:105,678,492"  → switch chrom + center
+        //   "105678492"                                 → center on current chrom
+        //   "IGHG4" / "BRCA2"                           → look up gene/feature name
+        //                                                  in loaded BED tracks
+        //                                                  (and the built-in IGH
+        //                                                  track), zoom to it
+        //   "chr14"                                     → switch chrom, fit
         let q = q.trim().replace('_', "").replace(',', "");
+        if q.is_empty() { return; }
         if let Some((chrom, pos)) = q.split_once(':') {
             self.set_chrom_by_name(chrom);
             if let Ok(p) = pos.parse::<f64>() {
                 self.center_at(p);
             }
-        } else if let Ok(p) = q.parse::<f64>() {
-            self.center_at(p);
-        } else if !q.is_empty() {
-            self.set_chrom_by_name(&q);
+            return;
         }
+        if let Ok(p) = q.parse::<f64>() {
+            self.center_at(p);
+            return;
+        }
+        // Gene/feature lookup wins over chrom-name fallback so users don't get
+        // surprised when a future BED track happens to share a chromosome name.
+        if self.jump_to_feature(&q) { return; }
+        self.set_chrom_by_name(&q);
+    }
+
+    /// Search loaded BED annotation tracks (plus the built-in IGH track) for a
+    /// feature whose name matches `q` case-insensitively.  Exact-match wins;
+    /// otherwise the first prefix match is taken.  On hit, switch chromosome
+    /// and zoom to the feature with 2× padding (min 20 kb) on each side.
+    fn jump_to_feature(&mut self, q: &str) -> bool {
+        let qlow = q.to_ascii_lowercase();
+        let pick = |feats: &[AnnotFeature]| -> Option<AnnotFeature> {
+            feats.iter().find(|f| f.name.eq_ignore_ascii_case(&qlow))
+                .or_else(|| feats.iter().find(|f| f.name.to_ascii_lowercase().starts_with(&qlow)))
+                .cloned()
+        };
+        let mut found: Option<AnnotFeature> = None;
+        for t in &self.atlas.annot_tracks {
+            if let Some(f) = pick(&t.features) { found = Some(f); break; }
+        }
+        if found.is_none() {
+            let igh = igh_default_track();
+            if let Some(f) = pick(&igh.features) { found = Some(f); }
+        }
+        let Some(f) = found else { return false; };
+        self.set_chrom_by_name(&f.chrom);
+        let pad = (((f.end - f.start) as f64) * 2.0).max(20_000.0);
+        self.view.view_start_bp = (f.start as f64) - pad;
+        self.view.view_end_bp = (f.end as f64) + pad;
+        self.view.clamp(self.current_chrom_length().map(|l| l as f64));
+        self.info_msg = Some(format!(
+            "→ {} ({}:{}-{})", f.name, f.chrom, f.start, f.end));
+        true
     }
 
     fn set_chrom_by_name(&mut self, name: &str) {
@@ -191,6 +239,48 @@ impl App {
 
     fn n_samples(&self) -> usize {
         self.atlas.bbf.as_ref().map(|b| b.header.n_samples as usize).unwrap_or(0)
+    }
+
+    /// Walk every bubble in the loaded .vpf, keep the ones currently passing
+    /// the user's filter sliders, and write them as a TSV the user can open
+    /// in R / Python / Excel.  This is the bulk equivalent of the right-click
+    /// "Copy as TSV row" action.
+    pub(crate) fn export_filtered_tsv(&mut self) {
+        let bbf = match &self.atlas.bbf { Some(b) => b, None => return };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("variantpaths_filtered.tsv")
+            .add_filter("TSV", &["tsv", "txt"])
+            .save_file() else { return; };
+
+        let mut out = String::with_capacity(64 * bbf.bubbles.len().min(50_000));
+        out.push_str("sample\tbubble\tchrom\tstart\tend\tlength\tvaf\ttotal_reads\tn_alts\tclass\tdbvar_id\tdbvar_recip\tdbvar_pop\tshared\n");
+        let mut n_kept = 0u64;
+        for b in &bbf.bubbles {
+            if !self.view.passes_filters(b) { continue; }
+            let sample = bbf.samples.get(b.sample_idx as u32).unwrap_or("?");
+            let bname = bbf.bubble_names.get(b.bubble_name_idx).unwrap_or("");
+            let chrom = bbf.chroms.get(b.chrom_idx as u32).unwrap_or("?");
+            let class = bbf.classes.get(b.class_idx as u32).unwrap_or("?");
+            let dbid = bbf.dbvar_ids.get(b.dbvar_id_idx).unwrap_or("");
+            use std::fmt::Write as _;
+            let _ = writeln!(out,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
+                sample, bname, chrom, b.start, b.end, b.length(),
+                b.vaf(), b.total_reads_approx(), b.n_alts,
+                class, dbid, b.dbvar_recip(), b.dbvar_pop_count,
+                u8::from(b.is_shared()));
+            n_kept += 1;
+        }
+        match std::fs::write(&path, &out) {
+            Ok(()) => {
+                self.info_msg = Some(format!(
+                    "exported {} bubbles → {}", n_kept, path.display()));
+            }
+            Err(e) => {
+                self.error_msg = Some(format!(
+                    "TSV export failed: {} ({})", e, path.display()));
+            }
+        }
     }
 
     /// Collect MSA rows for all bubbles at the same locus as the given
@@ -256,212 +346,8 @@ impl eframe::App for App {
         ctx.input(|i| {
             if i.key_pressed(egui::Key::F11) { self.perf_visible = !self.perf_visible; }
         });
-        // ----- TopPanel: toolbar -----
-        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
-            // first row: file / nav
-            ui.horizontal(|ui| {
-                if ui.button("Open .vpf").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("VariantPaths File", &["vpf"])
-                        .pick_file() { self.load_bbf(&p); }
-                }
-                if ui.button("Open Reference (.fa)").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("FASTA", &["fa","fasta","fna"])
-                        .pick_file() { self.load_fasta(&p); }
-                }
-                if ui.button("Open BED").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("BED", &["bed"])
-                        .pick_file() { self.load_bed(&p); }
-                }
-                if ui.button("Open .vpz (sequences)").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("VariantPaths Sequences", &["vpz"])
-                        .pick_file() { self.load_bbz(&p); }
-                }
-                ui.separator();
-                let has_bbf = self.atlas.bbf.is_some();
-                if has_bbf {
-                    let (chrom_names, chrom_lens, current_idx) = {
-                        let b = self.atlas.bbf.as_ref().unwrap();
-                        (
-                            b.chroms.strings.clone(),
-                            b.chrom_index.iter().map(|c| c.length_bp).collect::<Vec<_>>(),
-                            self.view.chrom_idx,
-                        )
-                    };
-                    let mut new_chrom_idx: Option<u16> = None;
-                    egui::ComboBox::from_label("chrom")
-                        .selected_text(chrom_names.get(current_idx as usize)
-                            .cloned().unwrap_or_default())
-                        .show_ui(ui, |ui| {
-                            for (i, name) in chrom_names.iter().enumerate() {
-                                if ui.selectable_label(i as u16 == current_idx, name).clicked() {
-                                    new_chrom_idx = Some(i as u16);
-                                }
-                            }
-                        });
-                    if let Some(i) = new_chrom_idx {
-                        self.view.chrom_idx = i;
-                        let len = chrom_lens.get(i as usize).copied().unwrap_or(1);
-                        self.view.view_start_bp = 0.0;
-                        self.view.view_end_bp = len as f64;
-                    }
-                    ui.add_sized([240.0, 20.0],
-                        egui::TextEdit::singleline(&mut self.view.jump_input)
-                            .hint_text("e.g. chr14:105_700_000"));
-                    if ui.button("Go").clicked() {
-                        let s = self.view.jump_input.clone();
-                        self.jump_to(&s);
-                    }
-                    ui.label(format!(
-                        "{}:{} - {}",
-                        chrom_names.get(self.view.chrom_idx as usize)
-                            .map(|s| s.as_str()).unwrap_or(""),
-                        format_bp(self.view.view_start_bp as i64),
-                        format_bp(self.view.view_end_bp as i64),
-                    ));
-                } else {
-                    ui.label("no .vpf loaded — drop a file or use Open .vpf");
-                }
-            });
-
-            // ----- Second row: Filters -----
-            if let Some(b) = self.atlas.bbf.as_ref() {
-                let sample_names = b.samples.strings.clone();
-                let class_names = b.classes.strings.clone();
-                drop(b); // release immutable borrow
-
-                ui.horizontal_wrapped(|ui| {
-                    egui::CollapsingHeader::new("Filters")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            // VAF range
-                            ui.label("VAF:");
-                            ui.add(egui::Slider::new(&mut self.view.vaf_min, 0.0..=1.0)
-                                .text("min")
-                                .logarithmic(true)
-                                .min_decimals(4)
-                                .step_by(0.0001));
-                            ui.add(egui::Slider::new(&mut self.view.vaf_max, 0.0..=1.0)
-                                .text("max")
-                                .logarithmic(true)
-                                .min_decimals(4)
-                                .step_by(0.0001));
-                            if self.view.vaf_min > self.view.vaf_max {
-                                self.view.vaf_max = self.view.vaf_min;
-                            }
-                            // VAF presets
-                            if ui.small_button("subclonal <5%").clicked() {
-                                self.view.vaf_min = 0.0; self.view.vaf_max = 0.05;
-                            }
-                            if ui.small_button("intermediate 5-25%").clicked() {
-                                self.view.vaf_min = 0.05; self.view.vaf_max = 0.25;
-                            }
-                            if ui.small_button("germline-like ≥25%").clicked() {
-                                self.view.vaf_min = 0.25; self.view.vaf_max = 1.0;
-                            }
-                            if ui.small_button("all").clicked() {
-                                self.view.vaf_min = 0.0; self.view.vaf_max = 1.0;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            // min total_reads (back-of-envelope: log2(R)*8)
-                            ui.label("min total_reads:");
-                            let mut approx_reads = if self.view.min_total_reads_log == 0 { 0u32 }
-                                else { (2.0_f32).powf(self.view.min_total_reads_log as f32 / 8.0) as u32 };
-                            if ui.add(egui::Slider::new(&mut approx_reads, 0..=500)
-                                .text("reads"))
-                                .changed()
-                            {
-                                self.view.min_total_reads_log = if approx_reads == 0 { 0 }
-                                    else { ((approx_reads as f32).log2() * 8.0).round().clamp(0.0, 255.0) as u8 };
-                            }
-                            ui.separator();
-                            ui.label("length range (bp):");
-                            ui.add(egui::DragValue::new(&mut self.view.min_length_bp)
-                                .speed(100).clamp_range(0..=1_000_000_000));
-                            ui.label("–");
-                            ui.add(egui::DragValue::new(&mut self.view.max_length_bp)
-                                .speed(100).clamp_range(0..=i32::MAX));
-                            if ui.small_button("reset").clicked() {
-                                self.view.min_length_bp = 0;
-                                self.view.max_length_bp = i32::MAX;
-                                self.view.min_total_reads_log = 0;
-                            }
-                        });
-
-                        // ensure visibility vecs are sized to current sample/class count
-                        if self.view.sample_visible.len() != sample_names.len() {
-                            self.view.sample_visible = vec![true; sample_names.len()];
-                        }
-                        if self.view.class_visible.len() != class_names.len() {
-                            self.view.class_visible = vec![true; class_names.len()];
-                        }
-
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("recurrence:");
-                            ui.radio_value(&mut self.view.shared_filter,
-                                SharedFilter::All, "all");
-                            ui.radio_value(&mut self.view.shared_filter,
-                                SharedFilter::SharedOnly, "shared (≥2 samples)");
-                            ui.radio_value(&mut self.view.shared_filter,
-                                SharedFilter::PrivateOnly, "private (1 sample)");
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("max lanes per sample:");
-                            let mut v = self.view.max_lanes_per_sample;
-                            ui.add(egui::Slider::new(&mut v, 0u32..=50)
-                                .integer()
-                                .text("(0 = all)"));
-                            self.view.max_lanes_per_sample = v;
-                            if ui.small_button("6").clicked() { self.view.max_lanes_per_sample = 6; }
-                            if ui.small_button("12").clicked() { self.view.max_lanes_per_sample = 12; }
-                            if ui.small_button("all").clicked() { self.view.max_lanes_per_sample = 0; }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("max dbVar pop count:");
-                            // u16::MAX maps to "no cap"; show as ∞.
-                            let mut cap_int = if self.view.max_pop_count == u16::MAX {
-                                10000u32
-                            } else {
-                                self.view.max_pop_count as u32
-                            };
-                            let resp = ui.add(egui::Slider::new(&mut cap_int, 0u32..=10000)
-                                .integer()
-                                .logarithmic(true)
-                                .text("nssv"));
-                            if resp.changed() {
-                                self.view.max_pop_count = if cap_int >= 10000 { u16::MAX } else { cap_int as u16 };
-                            }
-                            if ui.small_button("rare ≤5").clicked() { self.view.max_pop_count = 5; }
-                            if ui.small_button("≤50").clicked() { self.view.max_pop_count = 50; }
-                            if ui.small_button("∞").clicked() { self.view.max_pop_count = u16::MAX; }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.checkbox(&mut self.view.force_haplotype_mode,
-                                "haplotype mode (two parallel lines, bubbles routed by VAF≷0.5)");
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("samples:");
-                            for (i, n) in sample_names.iter().enumerate() {
-                                ui.checkbox(&mut self.view.sample_visible[i], n);
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("classes:");
-                            for (i, n) in class_names.iter().enumerate() {
-                                let col = self.atlas.class_color(i as u8);
-                                let label = egui::RichText::new(n).color(col);
-                                ui.checkbox(&mut self.view.class_visible[i], label);
-                            }
-                        });
-                    });
-                });
-            }
-        });
+        // ----- TopPanel: toolbar (file open, jump, filters) — see ui_topbar -----
+        ui_topbar::show_topbar(self, ctx);
 
         // ----- BottomPanel: status -----
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -673,6 +559,18 @@ impl eframe::App for App {
                         egui::Color32::from_gray(160));
                     y += ANNOT_H + 1.0;
                 }
+
+            // ----- Cross-sample density heatmap (allocated outside the
+            // header rect so the existing y-flow stays untouched).  Renders
+            // between annotation tracks and per-sample stacks. -----
+            if self.heatmap_visible && n_samples > 0 {
+                let hm_h = heatmap::height(n_samples);
+                let (hm_rect, _hm_resp) = ui.allocate_exact_size(
+                    egui::Vec2::new(avail_w, hm_h),
+                    egui::Sense::hover());
+                let hm_painter = ui.painter_at(hm_rect);
+                heatmap::draw_heatmap(&hm_painter, hm_rect, &self.view, bbf);
+            }
 
                 // Bubble tracks: one per sample, each in its OWN ScrollArea.
                 let bp_per_px = self.view.bp_per_px(track_rect_w);
