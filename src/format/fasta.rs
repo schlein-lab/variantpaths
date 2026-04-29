@@ -96,3 +96,94 @@ impl FastaReader {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a deterministic .fa + .fai pair into a unique temp dir and
+    /// return the FASTA path. Caller is responsible for nothing — the temp
+    /// dir is per-test-process and OS will reap it.
+    fn fixture(line_bases: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("vp_fasta_test_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa_path = dir.join("ref.fa");
+        let fai_path = dir.join("ref.fa.fai");
+
+        // Build a chr1 of 200 bp = "ACGT" repeated.
+        let total = 200usize;
+        let mut seq = String::with_capacity(total);
+        for i in 0..total {
+            seq.push(['A', 'C', 'G', 'T'][i % 4]);
+        }
+
+        // Write FASTA wrapped at line_bases per line.
+        let mut f = std::fs::File::create(&fa_path).unwrap();
+        let header = ">chr1\n";
+        f.write_all(header.as_bytes()).unwrap();
+        let header_len = header.len() as u64;
+        let mut written = 0usize;
+        while written < total {
+            let take = (total - written).min(line_bases);
+            f.write_all(&seq.as_bytes()[written..written + take]).unwrap();
+            f.write_all(b"\n").unwrap();
+            written += take;
+        }
+        // Write FAI: name, length, offset, line_bases, line_bytes
+        let line_bytes = line_bases + 1; // +1 for '\n'
+        let mut fai = std::fs::File::create(&fai_path).unwrap();
+        writeln!(fai, "chr1\t{}\t{}\t{}\t{}",
+            total, header_len, line_bases, line_bytes).unwrap();
+        fa_path
+    }
+
+    #[test]
+    fn fetch_aligned_to_line_bases() {
+        let fa = fixture(60);
+        let r = FastaReader::open(&fa).expect("open");
+        assert_eq!(r.fai.get("chr1").map(|e| e.length), Some(200));
+        let bytes = r.fetch("chr1", 0, 4).unwrap();
+        assert_eq!(bytes, b"ACGT");
+    }
+
+    #[test]
+    fn fetch_crosses_line_boundary() {
+        let fa = fixture(60); // newline every 60 bases
+        let r = FastaReader::open(&fa).unwrap();
+        // bases 58..62 cross the wrap; correct answer should still be ACGT-pattern.
+        let bytes = r.fetch("chr1", 58, 62).unwrap();
+        let expected: Vec<u8> = (58..62).map(|i| b"ACGT"[i % 4] as u8).collect();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn fetch_clamps_to_chrom_length() {
+        let fa = fixture(60);
+        let r = FastaReader::open(&fa).unwrap();
+        let bytes = r.fetch("chr1", 198, 9999).unwrap();
+        assert_eq!(bytes.len(), 2);
+    }
+
+    #[test]
+    fn fetch_unknown_chrom_errors() {
+        let fa = fixture(60);
+        let r = FastaReader::open(&fa).unwrap();
+        assert!(r.fetch("chrX", 0, 10).is_err());
+    }
+
+    #[test]
+    fn fetch_returns_uppercase() {
+        // Same fixture; bytes are already uppercase, but the function must
+        // not mangle them either. (Lowercase coverage is in the .to_ascii_uppercase
+        // branch; we just confirm round-trip is uppercase.)
+        let fa = fixture(80);
+        let r = FastaReader::open(&fa).unwrap();
+        let b = r.fetch("chr1", 0, 8).unwrap();
+        assert!(b.iter().all(|c| c.is_ascii_uppercase()));
+    }
+}

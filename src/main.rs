@@ -97,9 +97,10 @@ impl App {
                     b.header.n_bubbles, b.header.n_samples, b.header.n_chroms,
                     b.header.reference_id,
                 ));
-                self.view.sample_visible = vec![true; b.header.n_samples as usize];
-                self.view.class_visible = vec![true; b.header.n_classes as usize];
                 let chrom_len = b.chrom_index.first().map(|c| c.length_bp).unwrap_or(1);
+                // Reset all view + filter state to defaults so the previous file's
+                // VAF/length/recurrence/pop-count sliders don't silently hide records
+                // in the new dataset.
                 self.view = ViewState::fit_chrom(chrom_len);
                 self.view.sample_visible = vec![true; b.header.n_samples as usize];
                 self.view.class_visible = vec![true; b.header.n_classes as usize];
@@ -421,6 +422,29 @@ impl eframe::App for App {
                             if ui.small_button("all").clicked() { self.view.max_lanes_per_sample = 0; }
                         });
                         ui.horizontal_wrapped(|ui| {
+                            ui.label("max dbVar pop count:");
+                            // u16::MAX maps to "no cap"; show as ∞.
+                            let mut cap_int = if self.view.max_pop_count == u16::MAX {
+                                10000u32
+                            } else {
+                                self.view.max_pop_count as u32
+                            };
+                            let resp = ui.add(egui::Slider::new(&mut cap_int, 0u32..=10000)
+                                .integer()
+                                .logarithmic(true)
+                                .text("nssv"));
+                            if resp.changed() {
+                                self.view.max_pop_count = if cap_int >= 10000 { u16::MAX } else { cap_int as u16 };
+                            }
+                            if ui.small_button("rare ≤5").clicked() { self.view.max_pop_count = 5; }
+                            if ui.small_button("≤50").clicked() { self.view.max_pop_count = 50; }
+                            if ui.small_button("∞").clicked() { self.view.max_pop_count = u16::MAX; }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.view.force_haplotype_mode,
+                                "haplotype mode (two parallel lines, bubbles routed by VAF≷0.5)");
+                        });
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("samples:");
                             for (i, n) in sample_names.iter().enumerate() {
                                 ui.checkbox(&mut self.view.sample_visible[i], n);
@@ -449,13 +473,18 @@ impl eframe::App for App {
                             let cls = b.classes.get(rec.class_idx as u32).unwrap_or("?");
                             let smp = b.samples.get(rec.sample_idx as u32).unwrap_or("?");
                             let dbv = b.dbvar_ids.get(rec.dbvar_id_idx).unwrap_or("");
+                            let pop_str = if rec.pop_count() == 0 {
+                                "novel".to_string()
+                            } else {
+                                format!("{} nssv", rec.pop_count())
+                            };
                             ui.label(format!(
-                                "{} | {} | {} | start={} end={} length={} VAF={:.4} | {} | dbVar={} recip={:.2}",
+                                "{} | {} | {} | start={} end={} length={} VAF={:.4} | dbVar={} recip={:.2} pop={}",
                                 smp, name, cls,
                                 format_bp(rec.start as i64),
                                 format_bp(rec.end as i64),
                                 format_bp(rec.length() as i64),
-                                rec.vaf(), cls, dbv, rec.dbvar_recip(),
+                                rec.vaf(), dbv, rec.dbvar_recip(), pop_str,
                             ));
                         }
                     }
@@ -647,7 +676,10 @@ impl eframe::App for App {
 
                 // Bubble tracks: one per sample, each in its OWN ScrollArea.
                 let bp_per_px = self.view.bp_per_px(track_rect_w);
-                let mode = pick_mode(bp_per_px);
+                let auto_mode = pick_mode(bp_per_px);
+                let mode = if self.view.force_haplotype_mode {
+                    crate::render::BubbleMode::Haplotype
+                } else { auto_mode };
                 let mut new_hover = None::<usize>;
                 let mut pending_msa_idx: Option<usize> = None;
                 let render_t0 = std::time::Instant::now();
@@ -741,6 +773,20 @@ impl eframe::App for App {
                                             ui.label(format!("dbVar match: {}  reciprocal-overlap={:.2}",
                                                 &dbvar_id, rec.dbvar_recip()));
                                         }
+                                        if rec.pop_count() > 0 {
+                                            let interp = match rec.pop_count() {
+                                                1        => "singleton in dbVar",
+                                                2..=5    => "rare (≤5 nssv obs.)",
+                                                6..=50   => "uncommon",
+                                                51..=500 => "common",
+                                                _        => "very common",
+                                            };
+                                            ui.label(format!(
+                                                "dbVar pop count: {} nssv  ({})",
+                                                rec.pop_count(), interp));
+                                        } else {
+                                            ui.label("dbVar pop count: 0  (novel — no region match)");
+                                        }
                                         // .bbz alt-sequences (if loaded for this bubble)
                                         let alts_for_bubble = self.atlas.bbz.as_ref()
                                             .and_then(|z| z.alts_for(&bname));
@@ -764,6 +810,48 @@ impl eframe::App for App {
                                                 vaf = rec.vaf(), recip = rec.dbvar_recip(),
                                                 dbid = &dbvar_id);
                                             ui.output_mut(|o| o.copied_text = tsv);
+                                            ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        // External lookups: dbVar (if matched) + UCSC by coords.
+                                        // nssv accessions go straight to the variant page; bare
+                                        // region IDs (nstd) need the search endpoint. If no
+                                        // dbVar id, fall back to a coordinate search.
+                                        let dbvar_url = if !dbvar_id.is_empty() {
+                                            if dbvar_id.starts_with("nssv") {
+                                                format!("https://www.ncbi.nlm.nih.gov/dbvar/variants/{}/", dbvar_id)
+                                            } else {
+                                                format!("https://www.ncbi.nlm.nih.gov/dbvar/?term={}", dbvar_id)
+                                            }
+                                        } else {
+                                            format!("https://www.ncbi.nlm.nih.gov/dbvar/?term=({}%3A{}-{})%5BBase+Position%5D",
+                                                &chrom, rec.start, rec.end)
+                                        };
+                                        let dbvar_label = if dbvar_id.is_empty() {
+                                            "Search dbVar by coordinates ↗".to_string()
+                                        } else {
+                                            format!("Open {} in dbVar ↗", &dbvar_id)
+                                        };
+                                        if ui.button(dbvar_label).clicked() {
+                                            ui.ctx().output_mut(|o| {
+                                                o.open_url = Some(egui::output::OpenUrl {
+                                                    url: dbvar_url,
+                                                    new_tab: true,
+                                                });
+                                            });
+                                            ui.close_menu();
+                                        }
+                                        // UCSC quick-jump by coordinates (defaults to GRCh38).
+                                        if ui.button("View locus in UCSC (hg38) ↗").clicked() {
+                                            let ucsc = format!(
+                                                "https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position={}%3A{}-{}",
+                                                &chrom, rec.start.max(0), rec.end.max(rec.start + 1));
+                                            ui.ctx().output_mut(|o| {
+                                                o.open_url = Some(egui::output::OpenUrl {
+                                                    url: ucsc,
+                                                    new_tab: true,
+                                                });
+                                            });
                                             ui.close_menu();
                                         }
                                         ui.separator();
